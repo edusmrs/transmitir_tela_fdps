@@ -15,6 +15,7 @@ import socket
 import struct
 import pickle
 import threading
+import queue
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -34,7 +35,9 @@ except ImportError:
 
 AUDIO_SAMPLE_RATE = 48000
 AUDIO_CHANNELS = 2
-AUDIO_BLOCK_SIZE = 1024
+AUDIO_BLOCK_SIZE = 2048    # blocos maiores = menos estalos, um pouco mais de latência
+AUDIO_QUEUE_MAX = 8        # limite de blocos em espera antes de descartar os mais antigos
+                            # (evita que o atraso do áudio cresça sem parar)
 
 RESOLUTIONS = {
     "Original (tela cheia)": None,
@@ -66,8 +69,13 @@ class ScreenShareApp:
         self.audio_clients = []    # sockets de áudio conectados
         self.audio_clients_lock = threading.Lock()
         self.audio_accept_thread = None
-        self.audio_send_thread = None
-        self.audio_recv_thread = None
+        self.audio_send_thread = None      # thread que captura o áudio (produtor)
+        self.audio_broadcast_thread = None  # thread que envia pela rede (consumidor)
+        self.audio_capture_queue = None    # fila entre captura e envio (lado servidor)
+
+        self.audio_recv_thread = None      # thread que recebe da rede (produtor)
+        self.audio_play_thread = None      # thread que toca o áudio (consumidor)
+        self.audio_playback_queue = None   # fila entre rede e reprodução (lado cliente)
 
         self.mode_var = tk.StringVar(value="server")
         self.ip_var = tk.StringVar(value="0.0.0.0")
@@ -329,6 +337,8 @@ class ScreenShareApp:
                     self.audio_sock.bind((ip, audio_port))
                     self.audio_sock.listen(5)
 
+                    self.audio_capture_queue = queue.Queue(maxsize=AUDIO_QUEUE_MAX)
+
                     self.audio_accept_thread = threading.Thread(
                         target=self._accept_audio_clients, daemon=True
                     )
@@ -338,6 +348,11 @@ class ScreenShareApp:
                         target=self._capture_and_broadcast_audio, daemon=True
                     )
                     self.audio_send_thread.start()
+
+                    self.audio_broadcast_thread = threading.Thread(
+                        target=self._broadcast_audio_worker, daemon=True
+                    )
+                    self.audio_broadcast_thread.start()
                     print(f"[áudio] Servidor de áudio escutando em {ip}:{audio_port}")
                 except Exception as e:
                     print(f"[áudio] ERRO ao abrir porta de áudio {audio_port}: {e}")
@@ -388,6 +403,11 @@ class ScreenShareApp:
             with self.clients_lock:
                 self.clients.append(conn)
 
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+
             self.root.after(0, self._update_status_clients)
 
     def _accept_audio_clients(self):
@@ -408,8 +428,15 @@ class ScreenShareApp:
             with self.audio_clients_lock:
                 self.audio_clients.append(conn)
 
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+
     def _capture_and_broadcast_audio(self):
-        """Captura o áudio que está tocando no sistema (loopback) e transmite."""
+        """Captura o áudio do sistema (loopback) e só o coloca numa fila.
+        Não faz rede aqui — assim uma rede lenta nunca trava a captura,
+        que é a causa mais comum de áudio robotizado/entrecortado."""
         try:
             speaker = sc.default_speaker()
             mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
@@ -418,8 +445,7 @@ class ScreenShareApp:
                 while self.running:
                     data = recorder.record(numframes=AUDIO_BLOCK_SIZE)
                     data = data.astype(np.float32).tobytes()
-                    message = struct.pack("Q", len(data)) + data
-                    self._broadcast_audio(message)
+                    self._queue_put_drop_old(self.audio_capture_queue, data)
         except Exception as e:
             # Áudio é um recurso extra; se falhar, a transmissão de vídeo continua normalmente.
             # Mas avisamos no console e no status para não falhar silenciosamente.
@@ -427,6 +453,35 @@ class ScreenShareApp:
             self.root.after(0, lambda: self.status_var.set(
                 self.status_var.get() + " | Áudio falhou: " + str(e)
             ))
+
+    def _broadcast_audio_worker(self):
+        """Consome a fila de áudio capturado e envia pela rede.
+        Roda numa thread separada da captura, para que uma rede lenta
+        nunca atrase a gravação em si."""
+        while self.running:
+            try:
+                data = self.audio_capture_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            message = struct.pack("Q", len(data)) + data
+            self._broadcast_audio(message)
+
+    @staticmethod
+    def _queue_put_drop_old(q, item):
+        """Coloca um item na fila; se estiver cheia, descarta o mais antigo
+        em vez de bloquear. Isso impede que o atraso do áudio cresça sem parar
+        quando a rede ou a reprodução ficam momentaneamente mais lentas."""
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                pass
 
     def _broadcast(self, message):
         """Envia o mesmo frame de vídeo para todos os espectadores conectados."""
@@ -479,6 +534,10 @@ class ScreenShareApp:
             self.sock.settimeout(10)
             self.sock.connect((ip, port))
             self.sock.settimeout(None)
+            try:
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             self.status_var.set(f"Conectado a {ip}:{port}")
 
             # Tenta também conectar no áudio (porta separada). Se falhar, segue só com vídeo.
@@ -530,45 +589,54 @@ class ScreenShareApp:
             self.root.after(0, self.stop)
 
     def _receive_and_play_audio(self, ip, audio_port):
-        """Conecta no socket de áudio do servidor e toca o som recebido."""
+        """Conecta no socket de áudio do servidor e enfileira os blocos recebidos.
+        A reprodução acontece numa thread separada (_play_audio_worker), para que
+        uma rede instável nunca trave a reprodução em si."""
         audio_conn = None
         try:
             audio_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             audio_conn.settimeout(10)
             audio_conn.connect((ip, audio_port))
             audio_conn.settimeout(None)
+            try:
+                audio_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             print(f"[áudio] Conectado ao servidor de áudio em {ip}:{audio_port}")
 
-            speaker = sc.default_speaker()
+            self.audio_playback_queue = queue.Queue(maxsize=AUDIO_QUEUE_MAX)
+            self.audio_play_thread = threading.Thread(
+                target=self._play_audio_worker, daemon=True
+            )
+            self.audio_play_thread.start()
+
             data_buffer = b""
             payload_size = struct.calcsize("Q")
 
-            with speaker.player(samplerate=AUDIO_SAMPLE_RATE, channels=AUDIO_CHANNELS) as player:
-                while self.running:
-                    while len(data_buffer) < payload_size:
-                        packet = audio_conn.recv(65536)
-                        if not packet:
-                            return
-                        data_buffer += packet
+            while self.running:
+                while len(data_buffer) < payload_size:
+                    packet = audio_conn.recv(65536)
+                    if not packet:
+                        return
+                    data_buffer += packet
 
-                    packed_msg_size = data_buffer[:payload_size]
-                    data_buffer = data_buffer[payload_size:]
-                    msg_size = struct.unpack("Q", packed_msg_size)[0]
+                packed_msg_size = data_buffer[:payload_size]
+                data_buffer = data_buffer[payload_size:]
+                msg_size = struct.unpack("Q", packed_msg_size)[0]
 
-                    while len(data_buffer) < msg_size:
-                        packet = audio_conn.recv(65536)
-                        if not packet:
-                            return
-                        data_buffer += packet
+                while len(data_buffer) < msg_size:
+                    packet = audio_conn.recv(65536)
+                    if not packet:
+                        return
+                    data_buffer += packet
 
-                    chunk = data_buffer[:msg_size]
-                    data_buffer = data_buffer[msg_size:]
+                chunk = data_buffer[:msg_size]
+                data_buffer = data_buffer[msg_size:]
 
-                    samples = np.frombuffer(chunk, dtype=np.float32).reshape(-1, AUDIO_CHANNELS)
-                    player.play(samples)
+                self._queue_put_drop_old(self.audio_playback_queue, chunk)
         except Exception as e:
             # Se o áudio falhar, o vídeo continua funcionando normalmente.
-            print(f"[áudio] ERRO na conexão/reprodução: {e}")
+            print(f"[áudio] ERRO na conexão: {e}")
             self.root.after(0, lambda: self.status_var.set(
                 self.status_var.get() + " | Áudio falhou: " + str(e)
             ))
@@ -578,6 +646,21 @@ class ScreenShareApp:
                     audio_conn.close()
             except Exception:
                 pass
+
+    def _play_audio_worker(self):
+        """Consome a fila de áudio recebido pela rede e toca no alto-falante."""
+        try:
+            speaker = sc.default_speaker()
+            with speaker.player(samplerate=AUDIO_SAMPLE_RATE, channels=AUDIO_CHANNELS) as player:
+                while self.running:
+                    try:
+                        chunk = self.audio_playback_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    samples = np.frombuffer(chunk, dtype=np.float32).reshape(-1, AUDIO_CHANNELS)
+                    player.play(samples)
+        except Exception as e:
+            print(f"[áudio] ERRO na reprodução: {e}")
 
 
 def main():
