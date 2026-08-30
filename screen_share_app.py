@@ -2,7 +2,7 @@
 App de Transmissão de Tela - Interface Gráfica
 ================================================
 Requisitos:
-    pip install mss opencv-python numpy requests soundcard
+    pip install mss opencv-python numpy requests soundcard sounddevice
 
 Como usar:
     python screen_share_app.py
@@ -32,6 +32,16 @@ try:
     import soundcard as sc
 except ImportError:
     sc = None
+
+# soundcard é usado para CAPTURAR o loopback do sistema (lado servidor).
+# sounddevice é usado para TOCAR o áudio recebido (lado cliente), porque
+# usa um callback nativo do sistema operacional para reprodução — isso
+# evita os estalos/robotização que aconteciam ao "empurrar" cada bloco
+# manualmente a partir do Python.
+try:
+    import sounddevice as sd
+except (ImportError, OSError):
+    sd = None
 
 AUDIO_SAMPLE_RATE = 48000
 AUDIO_CHANNELS = 2
@@ -186,12 +196,27 @@ class ScreenShareApp:
         )
         note.pack(pady=(15, 0))
 
-        if sc is None:
+        if sc is None and sd is None:
             self.audio_check.config(state="disabled")
             self.audio_var.set(False)
             warn = ttk.Label(
-                self.root, text="(instale 'soundcard' para habilitar áudio: pip install soundcard)",
+                self.root,
+                text="(instale as libs de áudio: pip install soundcard sounddevice)",
                 foreground="red"
+            )
+            warn.pack()
+        elif sc is None:
+            warn = ttk.Label(
+                self.root,
+                text="(instale 'soundcard' para poder transmitir áudio como servidor: pip install soundcard)",
+                foreground="orange"
+            )
+            warn.pack()
+        elif sd is None:
+            warn = ttk.Label(
+                self.root,
+                text="(instale 'sounddevice' para poder ouvir áudio como cliente: pip install sounddevice)",
+                foreground="orange"
             )
             warn.pack()
 
@@ -235,7 +260,7 @@ class ScreenShareApp:
             return
         port = int(port_str)
 
-        use_audio = self.audio_var.get() and sc is not None
+        use_audio = self.audio_var.get() and (sc is not None or sd is not None)
         audio_port = None
         if use_audio:
             if not audio_port_str.isdigit():
@@ -544,7 +569,7 @@ class ScreenShareApp:
             self.status_var.set(f"Conectado a {ip}:{port}")
 
             # Tenta também conectar no áudio (porta separada). Se falhar, segue só com vídeo.
-            use_audio = self.audio_var.get() and sc is not None and audio_port is not None
+            use_audio = self.audio_var.get() and sd is not None and audio_port is not None
             if use_audio:
                 self.audio_recv_thread = threading.Thread(
                     target=self._receive_and_play_audio, args=(ip, audio_port), daemon=True
@@ -652,25 +677,44 @@ class ScreenShareApp:
 
     def _play_audio_worker(self):
         """Consome a fila de áudio recebido pela rede e toca no alto-falante.
-        Mantém um fluxo contínuo (tocando silêncio nos instantes sem dados
-        novos) porque parar/reiniciar o stream de áudio a cada bloco vazio
-        é a causa mais comum do som ficar 'robotizado'/entrecortado."""
+
+        Usa sounddevice com um callback nativo do sistema operacional: o
+        próprio SO chama nossa função quando precisa de mais dados, em vez
+        da gente "empurrar" cada bloco manualmente pelo Python. Isso evita
+        os estalos/robotização causados por atrasos de timing do Python
+        (GIL, threads concorrentes) que aconteciam com o método anterior.
+        """
+        silence = np.zeros((AUDIO_BLOCK_SIZE, AUDIO_CHANNELS), dtype=np.float32)
+
+        def callback(outdata, frames, time_info, status):
+            if status:
+                print(f"[áudio] status do stream: {status}")
+            try:
+                chunk = self.audio_playback_queue.get_nowait()
+                samples = np.frombuffer(chunk, dtype=np.float32).reshape(-1, AUDIO_CHANNELS)
+            except queue.Empty:
+                samples = silence
+
+            if len(samples) < frames:
+                pad = np.zeros((frames - len(samples), AUDIO_CHANNELS), dtype=np.float32)
+                samples = np.vstack([samples, pad])
+            elif len(samples) > frames:
+                samples = samples[:frames]
+
+            outdata[:] = samples
+
         try:
-            speaker = sc.default_speaker()
-            silence = np.zeros((AUDIO_BLOCK_SIZE, AUDIO_CHANNELS), dtype=np.float32)
-            with speaker.player(
+            with sd.OutputStream(
                 samplerate=AUDIO_SAMPLE_RATE, channels=AUDIO_CHANNELS,
-                blocksize=AUDIO_BLOCK_SIZE
-            ) as player:
+                blocksize=AUDIO_BLOCK_SIZE, dtype='float32', callback=callback
+            ):
                 while self.running:
-                    try:
-                        chunk = self.audio_playback_queue.get(timeout=0.1)
-                        samples = np.frombuffer(chunk, dtype=np.float32).reshape(-1, AUDIO_CHANNELS)
-                    except queue.Empty:
-                        samples = silence
-                    player.play(samples)
+                    sd.sleep(100)
         except Exception as e:
-            print(f"[áudio] ERRO na reprodução: {e}")
+            print(f"[áudio] ERRO na reprodução (sounddevice): {e}")
+            self.root.after(0, lambda: self.status_var.set(
+                self.status_var.get() + " | Reprodução falhou: " + str(e)
+            ))
 
 
 def main():
