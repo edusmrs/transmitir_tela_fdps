@@ -23,6 +23,13 @@ import cv2
 import numpy as np
 import mss
 
+APP_VERSION = "1.2.0"
+
+try:
+    import win32gui
+except ImportError:
+    win32gui = None
+
 try:
     import requests
 except ImportError:
@@ -61,8 +68,8 @@ RESOLUTIONS = {
 class ScreenShareApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Transmissão de Tela")
-        self.root.geometry("440x460")
+        self.root.title(f"Transmissão de Tela - v{APP_VERSION}")
+        self.root.geometry("460x620")
         self.root.resizable(False, False)
 
         self.running = False
@@ -94,7 +101,11 @@ class ScreenShareApp:
         self.quality_var = tk.IntVar(value=60)
         self.resolution_var = tk.StringVar(value="1280x720 (recomendado)")
         self.audio_var = tk.BooleanVar(value=True)
+        self.capture_mode_var = tk.StringVar(value="screen")
+        self.monitor_var = tk.StringVar(value="Monitor 1")
+        self.app_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Parado")
+        self.version_var = tk.StringVar(value=f"Versão: {APP_VERSION}")
 
         self._build_ui()
 
@@ -165,6 +176,39 @@ class ScreenShareApp:
         )
         self.audio_check.pack(side="left")
 
+        source_frame = ttk.LabelFrame(self.root, text="Fonte da transmissão")
+        source_frame.pack(fill="x", **pad)
+
+        ttk.Radiobutton(
+            source_frame, text="Tela inteira",
+            variable=self.capture_mode_var, value="screen",
+            command=self._update_capture_controls
+        ).pack(anchor="w", padx=10, pady=3)
+
+        ttk.Radiobutton(
+            source_frame, text="Aplicativo específico",
+            variable=self.capture_mode_var, value="window",
+            command=self._update_capture_controls
+        ).pack(anchor="w", padx=10, pady=3)
+
+        monitor_row = ttk.Frame(source_frame)
+        monitor_row.pack(fill="x", padx=10, pady=5)
+        ttk.Label(monitor_row, text="Monitor:", width=18).pack(side="left")
+        self.monitor_combo = ttk.Combobox(
+            monitor_row, textvariable=self.monitor_var,
+            state="readonly", width=24
+        )
+        self.monitor_combo.pack(side="left", fill="x", expand=True)
+
+        app_row = ttk.Frame(source_frame)
+        app_row.pack(fill="x", padx=10, pady=5)
+        ttk.Label(app_row, text="Aplicativo:", width=18).pack(side="left")
+        self.app_combo = ttk.Combobox(
+            app_row, textvariable=self.app_var,
+            state="readonly", width=24
+        )
+        self.app_combo.pack(side="left", fill="x", expand=True)
+
         # Botão para descobrir IP público (útil no modo servidor)
         self.ip_btn = ttk.Button(
             conn_frame, text="Descobrir meu IP público",
@@ -195,6 +239,8 @@ class ScreenShareApp:
             foreground="gray", justify="center"
         )
         note.pack(pady=(15, 0))
+
+        ttk.Label(self.root, textvariable=self.version_var, foreground="dim gray").pack(pady=(0, 8))
 
         if sc is None and sd is None:
             self.audio_check.config(state="disabled")
@@ -231,6 +277,119 @@ class ScreenShareApp:
         else:
             self.ip_label.config(text="IP do servidor (do seu amigo):")
             self.ip_var.set("")
+        self._update_capture_controls()
+
+    def _update_capture_controls(self):
+        server_mode = self.mode_var.get() == "server"
+        if not server_mode:
+            self.monitor_combo.config(state="disabled")
+            self.app_combo.config(state="disabled")
+            return
+
+        self._refresh_monitor_list()
+        self._refresh_window_list()
+
+        if self.capture_mode_var.get() == "window":
+            self.monitor_combo.config(state="disabled")
+            self.app_combo.config(state="readonly")
+        else:
+            self.monitor_combo.config(state="readonly")
+            self.app_combo.config(state="disabled")
+
+    def _refresh_monitor_list(self):
+        try:
+            with mss.mss() as sct:
+                monitor_labels = [f"Monitor {idx}" for idx in range(1, len(sct.monitors))]
+        except Exception:
+            monitor_labels = ["Monitor 1"]
+
+        if not monitor_labels:
+            monitor_labels = ["Monitor 1"]
+
+        self.monitor_combo["values"] = monitor_labels
+        if self.monitor_var.get() not in monitor_labels:
+            self.monitor_var.set(monitor_labels[0])
+
+    def _refresh_window_list(self):
+        if win32gui is None:
+            self.app_combo["values"] = ["Windows API indisponível"]
+            self.app_combo.config(state="disabled")
+            self.app_var.set("")
+            return
+
+        titles = []
+        seen = set()
+
+        def enum_windows(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd).strip()
+                if title and title not in seen:
+                    seen.add(title)
+                    titles.append(title)
+            return True
+
+        try:
+            win32gui.EnumWindows(enum_windows, None)
+        except Exception:
+            titles = []
+
+        if not titles:
+            titles = ["Nenhum aplicativo visível"]
+            self.app_combo.config(state="disabled")
+            self.app_var.set("")
+        else:
+            self.app_combo.config(state="readonly")
+            if self.app_var.get() not in titles:
+                self.app_var.set(titles[0])
+
+        self.app_combo["values"] = titles
+
+    def _monitor_index(self):
+        selected = self.monitor_var.get()
+        try:
+            return int(selected.replace("Monitor ", ""))
+        except ValueError:
+            return 1
+
+    def _find_window_by_title(self, title):
+        if win32gui is None:
+            return None
+
+        target = title.strip()
+        found = None
+
+        def enum_windows(hwnd, _):
+            nonlocal found
+            if found is not None:
+                return False
+            if win32gui.IsWindowVisible(hwnd):
+                current_title = win32gui.GetWindowText(hwnd).strip()
+                if current_title == target:
+                    found = hwnd
+                    return False
+            return True
+
+        win32gui.EnumWindows(enum_windows, None)
+        return found
+
+    def _window_capture_rect(self):
+        title = self.app_var.get().strip()
+        if not title or title == "Nenhum aplicativo visível" or title == "Windows API indisponível":
+            raise RuntimeError("Selecione um aplicativo válido para transmitir.")
+
+        hwnd = self._find_window_by_title(title)
+        if hwnd is None:
+            raise RuntimeError(f"Não foi possível localizar a janela '{title}'.")
+
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        width = max(right - left, 1)
+        height = max(bottom - top, 1)
+        return {"left": left, "top": top, "width": width, "height": height}
+
+    def _capture_target(self):
+        if self.capture_mode_var.get() == "window":
+            return {"type": "window", "rect": self._window_capture_rect()}
+        return {"type": "monitor", "index": self._monitor_index()}
 
     def _show_public_ip(self):
         if requests is None:
@@ -385,11 +544,17 @@ class ScreenShareApp:
 
             quality = self.quality_var.get()
             target_res = RESOLUTIONS.get(self.resolution_var.get())
+            capture_target = self._capture_target()
 
             with mss.mss() as sct:
-                monitor = sct.monitors[1]
                 while self.running:
-                    img = np.array(sct.grab(monitor))
+                    if capture_target["type"] == "window":
+                        region = capture_target["rect"]
+                        img = np.array(sct.grab(region))
+                    else:
+                        monitor_index = max(1, min(capture_target["index"], len(sct.monitors) - 1))
+                        img = np.array(sct.grab(sct.monitors[monitor_index]))
+
                     img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
                     if target_res is not None:
