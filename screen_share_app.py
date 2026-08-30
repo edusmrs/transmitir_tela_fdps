@@ -35,7 +35,7 @@ except ImportError:
 
 AUDIO_SAMPLE_RATE = 48000
 AUDIO_CHANNELS = 2
-AUDIO_BLOCK_SIZE = 2048    # blocos maiores = menos estalos, um pouco mais de latência
+AUDIO_BLOCK_SIZE = 4096    # blocos maiores = menos estalos, um pouco mais de latência
 AUDIO_QUEUE_MAX = 8        # limite de blocos em espera antes de descartar os mais antigos
                             # (evita que o atraso do áudio cresça sem parar)
 
@@ -441,7 +441,10 @@ class ScreenShareApp:
             speaker = sc.default_speaker()
             mic = sc.get_microphone(id=str(speaker.name), include_loopback=True)
             print(f"[áudio] Capturando loopback de: {mic.name}")
-            with mic.recorder(samplerate=AUDIO_SAMPLE_RATE, channels=AUDIO_CHANNELS) as recorder:
+            with mic.recorder(
+                samplerate=AUDIO_SAMPLE_RATE, channels=AUDIO_CHANNELS,
+                blocksize=AUDIO_BLOCK_SIZE
+            ) as recorder:
                 while self.running:
                     data = recorder.record(numframes=AUDIO_BLOCK_SIZE)
                     data = data.astype(np.float32).tobytes()
@@ -648,16 +651,23 @@ class ScreenShareApp:
                 pass
 
     def _play_audio_worker(self):
-        """Consome a fila de áudio recebido pela rede e toca no alto-falante."""
+        """Consome a fila de áudio recebido pela rede e toca no alto-falante.
+        Mantém um fluxo contínuo (tocando silêncio nos instantes sem dados
+        novos) porque parar/reiniciar o stream de áudio a cada bloco vazio
+        é a causa mais comum do som ficar 'robotizado'/entrecortado."""
         try:
             speaker = sc.default_speaker()
-            with speaker.player(samplerate=AUDIO_SAMPLE_RATE, channels=AUDIO_CHANNELS) as player:
+            silence = np.zeros((AUDIO_BLOCK_SIZE, AUDIO_CHANNELS), dtype=np.float32)
+            with speaker.player(
+                samplerate=AUDIO_SAMPLE_RATE, channels=AUDIO_CHANNELS,
+                blocksize=AUDIO_BLOCK_SIZE
+            ) as player:
                 while self.running:
                     try:
-                        chunk = self.audio_playback_queue.get(timeout=0.5)
+                        chunk = self.audio_playback_queue.get(timeout=0.1)
+                        samples = np.frombuffer(chunk, dtype=np.float32).reshape(-1, AUDIO_CHANNELS)
                     except queue.Empty:
-                        continue
-                    samples = np.frombuffer(chunk, dtype=np.float32).reshape(-1, AUDIO_CHANNELS)
+                        samples = silence
                     player.play(samples)
         except Exception as e:
             print(f"[áudio] ERRO na reprodução: {e}")
